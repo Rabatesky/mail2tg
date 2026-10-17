@@ -104,6 +104,10 @@ class Config:
     max_attachment_mb: int
     max_body_chars: int
     show_links: bool
+    translate: bool
+    translate_from: str
+    translate_to: str
+    translate_proxy: str
     backfill: int
     state_file: Path
 
@@ -138,6 +142,10 @@ class Config:
             max_attachment_mb=min(TG_BOT_FILE_LIMIT_MB, env_int("MAX_ATTACHMENT_MB", 20)),
             max_body_chars=env_int("MAX_BODY_CHARS", 12000),
             show_links=env_bool("SHOW_LINKS", False),
+            translate=env_bool("TRANSLATE", True),
+            translate_from=env_str("TRANSLATE_FROM", "en") or "auto",
+            translate_to=env_str("TRANSLATE_TO", "ru") or "ru",
+            translate_proxy=env_str("TRANSLATE_PROXY"),
             backfill=max(0, env_int("BACKFILL_ON_FIRST_RUN", 0)),
             state_file=state_file,
         )
@@ -410,7 +418,122 @@ def chunk_escaped(text: str, limit: int) -> list[str]:
     return [html.escape(c, quote=False) for c in chunks if c.strip()]
 
 
-def format_messages(msg: Message, cfg: Config) -> list[str]:
+# ───────────────────────────── перевод ─────────────────────────────
+
+class TranslationError(Exception):
+    pass
+
+
+def mostly_cyrillic(text: str) -> bool:
+    letters = [ch for ch in text if ch.isalpha()]
+    if not letters:
+        return True
+    cyr = sum(1 for ch in letters if "Ѐ" <= ch <= "ӿ")
+    return cyr / len(letters) > 0.5
+
+
+def split_for_translation(text: str, limit: int) -> list[tuple[str, str]]:
+    """Делит текст на куски ≤ limit символов. Возвращает пары (кусок, разделитель после него)."""
+    pieces: list[tuple[str, str]] = []
+    buf = ""
+    for line in text.split("\n"):
+        if len(line) > limit:
+            if buf:
+                pieces.append((buf, "\n"))
+                buf = ""
+            current = ""
+            for sentence in re.split(r"(?<=[.!?…])\s+", line):
+                while len(sentence) > limit:
+                    if current:
+                        pieces.append((current, " "))
+                        current = ""
+                    cut = sentence.rfind(" ", 0, limit)
+                    cut = cut if cut > limit // 2 else limit
+                    pieces.append((sentence[:cut], " "))
+                    sentence = sentence[cut:].lstrip()
+                if current and len(current) + 1 + len(sentence) > limit:
+                    pieces.append((current, " "))
+                    current = sentence
+                else:
+                    current = f"{current} {sentence}" if current else sentence
+            if current:
+                pieces.append((current, "\n"))
+            continue
+        candidate = f"{buf}\n{line}" if buf else line
+        if len(candidate) > limit:
+            pieces.append((buf, "\n"))
+            buf = line
+        else:
+            buf = candidate
+    if buf:
+        pieces.append((buf, "\n"))
+    return pieces
+
+
+class GoogleTranslate:
+    """Бесплатный (неофициальный) эндпоинт Google Translate — без ключа и регистрации."""
+
+    URL = "https://translate.googleapis.com/translate_a/single"
+    CHUNK = 1800  # текст идёт в адресе запроса, поэтому куски небольшие
+
+    def __init__(self, source: str = "auto", target: str = "ru", proxy: str = ""):
+        self.source = source
+        self.target = target
+        self.session = requests.Session()
+        self.session.headers["User-Agent"] = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        )
+        if proxy:
+            self.session.proxies = {"http": proxy, "https": proxy}
+
+    def _request(self, text: str) -> tuple[str, str | None]:
+        params = {"client": "gtx", "sl": self.source, "tl": self.target, "dt": "t", "q": text}
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                resp = self.session.get(self.URL, params=params, timeout=(10, 30))
+                if resp.status_code == 429:
+                    raise TranslationError("Google ограничил частоту запросов (429)")
+                resp.raise_for_status()
+                data = resp.json()
+                segments = data[0] or []
+                translated = "".join(seg[0] for seg in segments if seg and isinstance(seg[0], str))
+                detected = data[2] if len(data) > 2 and isinstance(data[2], str) else None
+                if not translated and text.strip():
+                    raise TranslationError("пустой ответ")
+                return translated, detected
+            except (requests.RequestException, ValueError, TypeError, IndexError, TranslationError) as exc:
+                last_error = exc
+                time.sleep(3 * (attempt + 1))
+        raise TranslationError(str(last_error))
+
+    def translate(self, text: str) -> str:
+        if not text.strip():
+            return text
+        if self.target == "ru" and mostly_cyrillic(text):
+            return text  # уже по-русски
+        out = []
+        for i, (piece, sep) in enumerate(split_for_translation(text, self.CHUNK)):
+            if not piece.strip():
+                out.append(piece + sep)
+                continue
+            if i:
+                time.sleep(0.3)
+            translated, detected = self._request(piece)
+            if i == 0 and detected == self.target:
+                return text  # письмо уже на нужном языке
+            out.append(translated.strip("\n") + sep)
+        return "".join(out).rstrip()
+
+
+def make_translator(cfg: Config) -> GoogleTranslate | None:
+    if not cfg.translate:
+        return None
+    return GoogleTranslate(cfg.translate_from, cfg.translate_to, cfg.translate_proxy)
+
+
+def format_messages(msg: Message, cfg: Config, translator: "GoogleTranslate | None" = None) -> list[str]:
     """Готовит текст письма для Telegram: список HTML-сообщений, каждое ≤ 4096 символов."""
     sender_name, sender_addr = parseaddr(decode_mime(msg.get("From")))
     sender = f"{sender_name} <{sender_addr}>" if sender_name else sender_addr
@@ -422,15 +545,30 @@ def format_messages(msg: Message, cfg: Config) -> list[str]:
     except Exception:
         date_str = decode_mime(msg.get("Date"))
 
-    header = f"📧 <b>{html.escape(subject, quote=False)}</b>\n<i>От: {html.escape(sender, quote=False)}</i>"
-    if date_str:
-        header += f"\n<i>{html.escape(date_str, quote=False)}</i>"
-
-    body = extract_body(msg, cfg.show_links) or "(письмо без текста)"
+    body = extract_body(msg, cfg.show_links)
     truncated = False
     if cfg.max_body_chars and len(body) > cfg.max_body_chars:
         body = body[: cfg.max_body_chars].rstrip()
         truncated = True
+
+    translate_note = ""
+    if translator is not None:
+        try:
+            new_subject = translator.translate(subject) if subject != "(без темы)" else subject
+            new_body = translator.translate(body)
+            if new_subject != subject or new_body != body:
+                subject, body = new_subject, normalize_text(new_body)
+                translate_note = "🌐 переведено Google Translate"
+        except TranslationError as exc:
+            log.warning("Перевод не удался (%s), отправляю оригинал", exc)
+            translate_note = "⚠️ перевод не удался — оригинал"
+    body = body or "(письмо без текста)"
+
+    header = f"📧 <b>{html.escape(subject, quote=False)}</b>\n<i>От: {html.escape(sender, quote=False)}</i>"
+    if date_str:
+        header += f"\n<i>{html.escape(date_str, quote=False)}</i>"
+    if translate_note:
+        header += f"\n<i>{translate_note}</i>"
 
     first_limit = TG_TEXT_LIMIT - len(header) - 2
     body_chunks = chunk_escaped(body, 3800)
@@ -568,6 +706,7 @@ class Forwarder:
         self.cfg = cfg
         self.mailbox = mailbox or Mailbox(cfg)
         self.tg = tg or Telegram(cfg.tg_token, cfg.tg_chat_id, cfg.tg_proxy)
+        self.translator = make_translator(cfg)
         self.state = load_state(cfg.state_file)
 
     def _save(self) -> None:
@@ -639,7 +778,7 @@ class Forwarder:
 
     def forward(self, msg: Message) -> None:
         first_id = None
-        for i, text in enumerate(format_messages(msg, self.cfg)):
+        for i, text in enumerate(format_messages(msg, self.cfg, self.translator)):
             try:
                 mid = self.tg.send_text(text, html_mode=True, reply_to=None if i == 0 else first_id)
             except TelegramPermanentError as exc:
@@ -774,7 +913,19 @@ def run_check(cfg: Config) -> None:
             print(f"   ✗ Ошибка: {exc}")
             ok = False
 
-    print(f"3) Фильтр отправителей: {', '.join(cfg.from_filter) or 'не задан — будут пересылаться ВСЕ письма'}")
+    print("3) Перевод")
+    translator = make_translator(cfg)
+    if translator is None:
+        print("   выключен (TRANSLATE=false)")
+    else:
+        try:
+            sample = "Hello! This is a test of the translation."
+            print(f"   ✓ «{sample}» → «{translator.translate(sample)}»")
+        except TranslationError as exc:
+            print(f"   ✗ Google Translate недоступен: {exc}\n"
+                  f"   Письма будут приходить без перевода. Можно задать TRANSLATE_PROXY.")
+
+    print(f"4) Фильтр отправителей: {', '.join(cfg.from_filter) or 'не задан — будут пересылаться ВСЕ письма'}")
     print("\nВсё в порядке." if ok else "\nЕсть ошибки, исправьте .env и запустите проверку снова.")
     sys.exit(0 if ok else 1)
 
