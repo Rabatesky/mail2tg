@@ -1,0 +1,832 @@
+#!/usr/bin/env python3
+"""
+mail2tg — пересылает письма от выбранных отправителей из IMAP-ящика в Telegram.
+
+Настроен на Gmail (imap.gmail.com, вход по паролю приложения),
+но работает с любым IMAP-сервером (Яндекс, Mail.ru, свой сервер).
+
+Запуск:
+    python3 mail2tg.py               # основной режим (бесконечный цикл)
+    python3 mail2tg.py --check       # проверить подключение к почте и Telegram
+    python3 mail2tg.py --get-chat-id # узнать свой chat_id (сначала напишите боту /start)
+    python3 mail2tg.py --once        # один проход и выход
+"""
+
+from __future__ import annotations
+
+import argparse
+import email
+import html
+import imaplib
+import json
+import logging
+import os
+import re
+import signal
+import socket
+import ssl
+import sys
+import time
+from dataclasses import dataclass
+from email.header import decode_header, make_header
+from email.message import Message
+from email.utils import getaddresses, parseaddr, parsedate_to_datetime
+from html.parser import HTMLParser
+from pathlib import Path
+
+import requests
+
+BASE_DIR = Path(__file__).resolve().parent
+log = logging.getLogger("mail2tg")
+
+TG_TEXT_LIMIT = 4096
+TG_CAPTION_LIMIT = 1024
+TG_BOT_FILE_LIMIT_MB = 50
+
+
+# ───────────────────────────── конфигурация ─────────────────────────────
+
+def load_env_file(path: Path) -> None:
+    """Минимальный парсер .env: KEY=VALUE, комментарии #, кавычки. Не перезаписывает уже заданные переменные."""
+    if not path.is_file():
+        return
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):]
+        key, _, value = line.partition("=")
+        key, value = key.strip(), value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        else:
+            value = re.sub(r"\s+#.*$", "", value)  # комментарий в конце строки
+        os.environ.setdefault(key, value)
+
+
+def env_str(name: str, default: str = "") -> str:
+    return os.environ.get(name, default).strip()
+
+
+def env_int(name: str, default: int) -> int:
+    value = env_str(name)
+    if not value:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        raise SystemExit(f"Ошибка в .env: {name} должно быть числом, а не {value!r}")
+
+
+def env_bool(name: str, default: bool) -> bool:
+    value = env_str(name).lower()
+    if not value:
+        return default
+    return value in ("1", "true", "yes", "on", "да")
+
+
+@dataclass
+class Config:
+    tg_token: str
+    tg_chat_id: str
+    tg_proxy: str
+    imap_host: str
+    imap_port: int
+    imap_security: str
+    imap_verify_tls: bool
+    imap_user: str
+    imap_password: str
+    imap_folder: str
+    from_filter: list[str]
+    poll_interval: int
+    send_attachments: bool
+    max_attachment_mb: int
+    max_body_chars: int
+    show_links: bool
+    backfill: int
+    state_file: Path
+
+    @classmethod
+    def from_env(cls) -> "Config":
+        security = env_str("IMAP_SECURITY", "ssl").lower()
+        if security not in ("starttls", "ssl", "plain"):
+            raise SystemExit("Ошибка в .env: IMAP_SECURITY должно быть starttls, ssl или plain")
+        state_file = Path(env_str("STATE_FILE", "state.json"))
+        if not state_file.is_absolute():
+            state_file = BASE_DIR / state_file
+        filters = [f.strip().lower() for f in re.split(r"[,;\s]+", env_str("FROM_FILTER")) if f.strip()]
+        imap_host = env_str("IMAP_HOST", "imap.gmail.com")
+        imap_password = env_str("IMAP_PASSWORD")
+        if imap_host.endswith("gmail.com"):
+            # Google показывает пароль приложения группами через пробел: "abcd efgh ijkl mnop"
+            imap_password = imap_password.replace(" ", "")
+        return cls(
+            tg_token=env_str("TELEGRAM_BOT_TOKEN"),
+            tg_chat_id=env_str("TELEGRAM_CHAT_ID"),
+            tg_proxy=env_str("TELEGRAM_PROXY"),
+            imap_host=imap_host,
+            imap_port=env_int("IMAP_PORT", 993),
+            imap_security=security,
+            imap_verify_tls=env_bool("IMAP_VERIFY_TLS", True),
+            imap_user=env_str("IMAP_USER"),
+            imap_password=imap_password,
+            imap_folder=env_str("IMAP_FOLDER", "INBOX"),
+            from_filter=filters,
+            poll_interval=max(10, env_int("POLL_INTERVAL", 60)),
+            send_attachments=env_bool("SEND_ATTACHMENTS", True),
+            max_attachment_mb=min(TG_BOT_FILE_LIMIT_MB, env_int("MAX_ATTACHMENT_MB", 20)),
+            max_body_chars=env_int("MAX_BODY_CHARS", 12000),
+            show_links=env_bool("SHOW_LINKS", False),
+            backfill=max(0, env_int("BACKFILL_ON_FIRST_RUN", 0)),
+            state_file=state_file,
+        )
+
+    def require(self, *names: str) -> None:
+        mapping = {
+            "TELEGRAM_BOT_TOKEN": self.tg_token,
+            "TELEGRAM_CHAT_ID": self.tg_chat_id,
+            "IMAP_USER": self.imap_user,
+            "IMAP_PASSWORD": self.imap_password,
+        }
+        missing = [n for n in names if not mapping.get(n)]
+        if missing:
+            raise SystemExit("Не заполнены параметры в .env: " + ", ".join(missing))
+
+
+# ───────────────────────────── Telegram ─────────────────────────────
+
+class TelegramPermanentError(Exception):
+    """Telegram отклонил запрос (ошибка 4xx) — повтор не поможет."""
+
+
+class TelegramTemporaryError(Exception):
+    """Сеть или Telegram недоступны — стоит повторить позже."""
+
+
+class Telegram:
+    def __init__(self, token: str, chat_id: str = "", proxy: str = ""):
+        self.token = token
+        self.chat_id = chat_id
+        self.session = requests.Session()
+        if proxy:
+            self.session.proxies = {"http": proxy, "https": proxy}
+
+    def _mask(self, text: str) -> str:
+        return text.replace(self.token, "***") if self.token else text
+
+    def call(self, method: str, data: dict | None = None, files: dict | None = None, attempts: int = 5):
+        url = f"https://api.telegram.org/bot{self.token}/{method}"
+        delay = 2
+        last_error = ""
+        for _ in range(attempts):
+            try:
+                resp = self.session.post(url, data=data, files=files, timeout=(15, 120))
+            except requests.RequestException as exc:
+                last_error = self._mask(str(exc))
+                log.warning("Telegram недоступен (%s), повтор через %s с", last_error, delay)
+                time.sleep(delay)
+                delay = min(delay * 2, 60)
+                continue
+            try:
+                payload = resp.json()
+            except ValueError:
+                payload = {}
+            if payload.get("ok"):
+                return payload["result"]
+            description = payload.get("description", resp.text[:200])
+            if resp.status_code == 429:
+                wait = int(payload.get("parameters", {}).get("retry_after", 5)) + 1
+                log.warning("Telegram просит подождать %s с (лимит сообщений)", wait)
+                time.sleep(wait)
+                continue
+            if resp.status_code >= 500:
+                last_error = f"{resp.status_code} {description}"
+                log.warning("Ошибка на стороне Telegram (%s), повтор через %s с", last_error, delay)
+                time.sleep(delay)
+                delay = min(delay * 2, 60)
+                continue
+            raise TelegramPermanentError(f"{method}: {resp.status_code} {description}")
+        raise TelegramTemporaryError(f"{method}: {last_error or 'не удалось отправить'}")
+
+    def send_text(self, text: str, html_mode: bool = False, reply_to: int | None = None) -> int:
+        data = {
+            "chat_id": self.chat_id,
+            "text": text,
+            "link_preview_options": json.dumps({"is_disabled": True}),
+        }
+        if html_mode:
+            data["parse_mode"] = "HTML"
+        if reply_to:
+            data["reply_parameters"] = json.dumps({"message_id": reply_to, "allow_sending_without_reply": True})
+        return self.call("sendMessage", data)["message_id"]
+
+    def send_document(self, filename: str, content: bytes, caption: str = "", reply_to: int | None = None) -> int:
+        data = {"chat_id": self.chat_id}
+        if caption:
+            data["caption"] = caption[:TG_CAPTION_LIMIT]
+        if reply_to:
+            data["reply_parameters"] = json.dumps({"message_id": reply_to, "allow_sending_without_reply": True})
+        files = {"document": (filename, content)}
+        return self.call("sendDocument", data, files)["message_id"]
+
+
+# ───────────────────────────── разбор писем ─────────────────────────────
+
+def decode_mime(value: str | None) -> str:
+    if not value:
+        return ""
+    try:
+        return str(make_header(decode_header(value))).strip()
+    except Exception:
+        return str(value).strip()
+
+
+class _HTMLToText(HTMLParser):
+    BLOCK_TAGS = {
+        "p", "div", "tr", "table", "ul", "ol", "li", "blockquote", "section", "article",
+        "header", "footer", "h1", "h2", "h3", "h4", "h5", "h6", "hr", "pre",
+    }
+    SKIP_TAGS = {"script", "style", "head", "title", "noscript"}
+
+    def __init__(self, show_links: bool):
+        super().__init__(convert_charrefs=True)
+        self.show_links = show_links
+        self.parts: list[str] = []
+        self.skip = 0
+        self.href_stack: list[tuple[str | None, int]] = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.SKIP_TAGS:
+            self.skip += 1
+        elif tag == "br":
+            self.parts.append("\n")
+        elif tag in self.BLOCK_TAGS:
+            self.parts.append("\n")
+            if tag == "li":
+                self.parts.append("• ")
+        elif tag == "td":
+            self.parts.append(" ")
+        elif tag == "a":
+            href = dict(attrs).get("href")
+            self.href_stack.append((href, len(self.parts)))
+
+    def handle_startendtag(self, tag, attrs):
+        if tag in ("br", "hr"):
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in self.SKIP_TAGS:
+            self.skip = max(0, self.skip - 1)
+        elif tag in self.BLOCK_TAGS and tag != "li":
+            self.parts.append("\n")
+        elif tag == "a" and self.href_stack:
+            href, start = self.href_stack.pop()
+            if self.show_links and href and href.startswith(("http://", "https://")):
+                link_text = "".join(self.parts[start:]).strip()
+                if href not in link_text:
+                    self.parts.append(f" ({href})")
+
+    def handle_data(self, data):
+        if not self.skip:
+            self.parts.append(data)
+
+    def text(self) -> str:
+        return "".join(self.parts)
+
+
+def html_to_text(raw_html: str, show_links: bool = False) -> str:
+    parser = _HTMLToText(show_links)
+    try:
+        parser.feed(raw_html)
+        parser.close()
+    except Exception:
+        return re.sub(r"<[^>]+>", " ", raw_html)
+    return parser.text()
+
+
+def normalize_text(text: str) -> str:
+    text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\xa0", " ").replace("‌", "")
+    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in text.split("\n")]
+    text = "\n".join(lines)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def part_text(part: Message) -> str:
+    payload = part.get_payload(decode=True)
+    if payload is None:
+        payload = part.get_payload()
+        return payload if isinstance(payload, str) else ""
+    charset = part.get_content_charset() or "utf-8"
+    for enc in (charset, "utf-8", "cp1251", "latin-1"):
+        try:
+            return payload.decode(enc)
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return payload.decode("utf-8", errors="replace")
+
+
+def is_attachment(part: Message) -> bool:
+    if part.is_multipart():
+        return False
+    disposition = (part.get("Content-Disposition") or "").lower()
+    if disposition.startswith("attachment"):
+        return True
+    # inline-картинки с именем файла и прочие файлы, которые не являются телом письма
+    return bool(part.get_filename()) and part.get_content_type() not in ("text/plain", "text/html")
+
+
+def extract_body(msg: Message, show_links: bool) -> str:
+    plain, html_parts = [], []
+    for part in msg.walk():
+        if part.is_multipart() or is_attachment(part):
+            continue
+        ctype = part.get_content_type()
+        if ctype == "text/plain":
+            plain.append(part_text(part))
+        elif ctype == "text/html":
+            html_parts.append(part_text(part))
+    if plain and any(p.strip() for p in plain):
+        return normalize_text("\n\n".join(plain))
+    if html_parts:
+        return normalize_text("\n\n".join(html_to_text(h, show_links) for h in html_parts))
+    return ""
+
+
+def extract_attachments(msg: Message) -> list[tuple[str, bytes]]:
+    result = []
+    for index, part in enumerate(msg.walk(), start=1):
+        if not is_attachment(part):
+            continue
+        content = part.get_payload(decode=True)
+        if not content:
+            continue
+        name = decode_mime(part.get_filename()) or f"attachment_{index}"
+        name = re.sub(r'[\\/:*?"<>|\r\n]+', "_", name)
+        result.append((name, content))
+    return result
+
+
+def sender_matches(from_header: str, filters: list[str]) -> bool:
+    if not filters:
+        return True
+    addresses = [addr.lower() for _, addr in getaddresses([from_header]) if addr]
+    for addr in addresses:
+        for f in filters:
+            if f.startswith("@"):
+                if addr.endswith(f):
+                    return True
+            elif addr == f:
+                return True
+    return False
+
+
+def chunk_escaped(text: str, limit: int) -> list[str]:
+    """Режет текст на куски, каждый из которых после html.escape не длиннее limit."""
+    chunks: list[str] = []
+    current = ""
+    for line in text.split("\n"):
+        candidate = f"{current}\n{line}" if current else line
+        if len(html.escape(candidate, quote=False)) <= limit:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+            current = ""
+        # строка сама по себе слишком длинная — режем по символам
+        while len(html.escape(line, quote=False)) > limit:
+            cut = limit
+            while cut > 1 and len(html.escape(line[:cut], quote=False)) > limit:
+                cut = max(1, cut - 50)
+            space = line.rfind(" ", 0, cut)
+            if space > cut // 2:
+                cut = space
+            chunks.append(line[:cut])
+            line = line[cut:].lstrip()
+        current = line
+    if current:
+        chunks.append(current)
+    return [html.escape(c, quote=False) for c in chunks if c.strip()]
+
+
+def format_messages(msg: Message, cfg: Config) -> list[str]:
+    """Готовит текст письма для Telegram: список HTML-сообщений, каждое ≤ 4096 символов."""
+    sender_name, sender_addr = parseaddr(decode_mime(msg.get("From")))
+    sender = f"{sender_name} <{sender_addr}>" if sender_name else sender_addr
+    subject = decode_mime(msg.get("Subject")) or "(без темы)"
+    date_str = ""
+    try:
+        if msg.get("Date"):
+            date_str = parsedate_to_datetime(msg["Date"]).astimezone().strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        date_str = decode_mime(msg.get("Date"))
+
+    header = f"📧 <b>{html.escape(subject, quote=False)}</b>\n<i>От: {html.escape(sender, quote=False)}</i>"
+    if date_str:
+        header += f"\n<i>{html.escape(date_str, quote=False)}</i>"
+
+    body = extract_body(msg, cfg.show_links) or "(письмо без текста)"
+    truncated = False
+    if cfg.max_body_chars and len(body) > cfg.max_body_chars:
+        body = body[: cfg.max_body_chars].rstrip()
+        truncated = True
+
+    first_limit = TG_TEXT_LIMIT - len(header) - 2
+    body_chunks = chunk_escaped(body, 3800)
+    messages: list[str] = []
+    if body_chunks and len(body_chunks[0]) <= first_limit:
+        messages.append(f"{header}\n\n{body_chunks.pop(0)}")
+    else:
+        messages.append(header)
+    messages.extend(body_chunks)
+    if truncated:
+        note = "\n\n<i>… текст обрезан, полностью — в почте</i>"
+        if len(messages[-1]) + len(note) <= TG_TEXT_LIMIT:
+            messages[-1] += note
+        else:
+            messages.append(note.strip())
+    return messages
+
+
+# ───────────────────────────── IMAP ─────────────────────────────
+
+def imap_quote(name: str) -> str:
+    return '"' + name.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+class Mailbox:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.conn: imaplib.IMAP4 | None = None
+
+    def _ssl_context(self) -> ssl.SSLContext:
+        ctx = ssl.create_default_context()
+        if not self.cfg.imap_verify_tls:
+            # для серверов с самоподписанным сертификатом (IMAP_VERIFY_TLS=false)
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+
+    def connect(self) -> None:
+        self.close()
+        cfg = self.cfg
+        log.info("Подключаюсь к IMAP %s:%s (%s)", cfg.imap_host, cfg.imap_port, cfg.imap_security)
+        if cfg.imap_security == "ssl":
+            conn = imaplib.IMAP4_SSL(cfg.imap_host, cfg.imap_port, ssl_context=self._ssl_context(), timeout=60)
+        else:
+            conn = imaplib.IMAP4(cfg.imap_host, cfg.imap_port, timeout=60)
+            if cfg.imap_security == "starttls":
+                conn.starttls(ssl_context=self._ssl_context())
+        conn.login(cfg.imap_user, cfg.imap_password)
+        self.conn = conn
+
+    def close(self) -> None:
+        if self.conn is not None:
+            try:
+                self.conn.logout()
+            except Exception:
+                pass
+            self.conn = None
+
+    def status(self) -> tuple[int, int]:
+        """Возвращает (UIDVALIDITY, UIDNEXT) папки."""
+        typ, data = self.conn.status(imap_quote(self.cfg.imap_folder), "(UIDVALIDITY UIDNEXT)")
+        if typ != "OK":
+            raise imaplib.IMAP4.error(f"STATUS не выполнен: {data}")
+        text = b" ".join(d for d in data if isinstance(d, bytes)).decode(errors="replace")
+        validity = re.search(r"UIDVALIDITY (\d+)", text)
+        uidnext = re.search(r"UIDNEXT (\d+)", text)
+        if not validity or not uidnext:
+            raise imaplib.IMAP4.error(f"Не удалось разобрать ответ STATUS: {text}")
+        return int(validity.group(1)), int(uidnext.group(1))
+
+    def select(self) -> None:
+        typ, data = self.conn.select(imap_quote(self.cfg.imap_folder), readonly=True)
+        if typ != "OK":
+            raise imaplib.IMAP4.error(f"Папка {self.cfg.imap_folder!r} не найдена: {data}")
+
+    def search_uids(self, criteria: str) -> list[int]:
+        typ, data = self.conn.uid("SEARCH", None, criteria)
+        if typ != "OK":
+            raise imaplib.IMAP4.error(f"SEARCH не выполнен: {data}")
+        raw = b" ".join(d for d in data if isinstance(d, bytes))
+        return sorted(int(x) for x in raw.split() if x.isdigit())
+
+    def _fetch(self, uid: int, what: str) -> bytes | None:
+        typ, data = self.conn.uid("FETCH", str(uid), what)
+        if typ != "OK":
+            raise imaplib.IMAP4.error(f"FETCH не выполнен: {data}")
+        for item in data:
+            if isinstance(item, tuple) and len(item) >= 2:
+                return item[1]
+        return None
+
+    def fetch_from_header(self, uid: int) -> str | None:
+        raw = self._fetch(uid, "(BODY.PEEK[HEADER.FIELDS (FROM)])")
+        if raw is None:
+            return None
+        return email.message_from_bytes(raw).get("From", "")
+
+    def fetch_message(self, uid: int) -> Message | None:
+        raw = self._fetch(uid, "(BODY.PEEK[])")
+        return email.message_from_bytes(raw) if raw else None
+
+    def list_folders(self) -> list[str]:
+        typ, data = self.conn.list()
+        folders = []
+        for line in data or []:
+            if isinstance(line, bytes):
+                match = re.search(rb'"([^"]*)"\s*$|(\S+)\s*$', line)
+                if match:
+                    folders.append((match.group(1) or match.group(2)).decode(errors="replace"))
+        return folders
+
+
+# ───────────────────────────── состояние ─────────────────────────────
+
+def load_state(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (ValueError, OSError) as exc:
+        log.warning("Не удалось прочитать %s (%s), начинаю заново", path, exc)
+        return {}
+
+
+def save_state(path: Path, state: dict) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+# ───────────────────────────── основная логика ─────────────────────────────
+
+class Forwarder:
+    def __init__(self, cfg: Config, mailbox: Mailbox | None = None, tg: Telegram | None = None):
+        self.cfg = cfg
+        self.mailbox = mailbox or Mailbox(cfg)
+        self.tg = tg or Telegram(cfg.tg_token, cfg.tg_chat_id, cfg.tg_proxy)
+        self.state = load_state(cfg.state_file)
+
+    def _save(self) -> None:
+        save_state(self.cfg.state_file, self.state)
+
+    def _init_state(self, uidvalidity: int, uidnext: int) -> list[int]:
+        """Первый запуск (или папку пересоздали): запоминаем текущую позицию, опционально досылаем последние письма."""
+        backlog: list[int] = []
+        if self.cfg.backfill:
+            if self.cfg.from_filter:
+                uids: set[int] = set()
+                for f in self.cfg.from_filter:
+                    uids.update(self.mailbox.search_uids(f"FROM {imap_quote(f.lstrip('@'))}"))
+                candidates = sorted(uids)
+            else:
+                candidates = self.mailbox.search_uids("ALL")
+            backlog = candidates[-self.cfg.backfill:]
+        self.state = {"uidvalidity": uidvalidity, "last_uid": uidnext - 1}
+        self._save()
+        log.info("Начальная позиция: UID %s. Пересылаться будут письма, пришедшие после неё%s.",
+                 uidnext - 1, f" (+{len(backlog)} последних для проверки)" if backlog else "")
+        return backlog
+
+    def poll(self) -> int:
+        """Один проход: проверяет новые письма и пересылает подходящие. Возвращает число отправленных."""
+        if self.mailbox.conn is not None:
+            # Gmail закрывает простаивающие соединения — проверяем и при необходимости переподключаемся
+            try:
+                self.mailbox.conn.noop()
+            except Exception:
+                self.mailbox.close()
+        if self.mailbox.conn is None:
+            self.mailbox.connect()
+        uidvalidity, uidnext = self.mailbox.status()
+        self.mailbox.select()
+
+        backlog: list[int] = []
+        if self.state.get("uidvalidity") != uidvalidity or "last_uid" not in self.state:
+            if self.state:
+                log.warning("UIDVALIDITY папки изменился, начинаю отсчёт заново")
+            backlog = self._init_state(uidvalidity, uidnext)
+
+        last_uid = int(self.state["last_uid"])
+        # "UID N:*" всегда возвращает хотя бы последнее письмо, поэтому отсеиваем уже обработанные
+        new_uids = [u for u in self.mailbox.search_uids(f"UID {last_uid + 1}:*") if u > last_uid]
+
+        sent = 0
+        for uid in backlog:
+            sent += self._process(uid, advance=False)
+        for uid in new_uids:
+            sent += self._process(uid, advance=True)
+        return sent
+
+    def _process(self, uid: int, advance: bool) -> int:
+        from_header = self.mailbox.fetch_from_header(uid)
+        forwarded = 0
+        if from_header is not None and sender_matches(decode_mime(from_header), self.cfg.from_filter):
+            msg = self.mailbox.fetch_message(uid)
+            if msg is not None:
+                self.forward(msg)
+                forwarded = 1
+                log.info("Переслано письмо UID %s от %s", uid, decode_mime(from_header))
+        else:
+            log.debug("Пропущено письмо UID %s от %s", uid, from_header)
+        if advance:
+            self.state["last_uid"] = uid
+            self._save()
+        return forwarded
+
+    def forward(self, msg: Message) -> None:
+        first_id = None
+        for i, text in enumerate(format_messages(msg, self.cfg)):
+            try:
+                mid = self.tg.send_text(text, html_mode=True, reply_to=None if i == 0 else first_id)
+            except TelegramPermanentError as exc:
+                # например, Telegram не принял разметку — отправим без неё
+                log.warning("Telegram отклонил сообщение (%s), отправляю без форматирования", exc)
+                plain = re.sub(r"<[^>]+>", "", text)
+                mid = self.tg.send_text(html.unescape(plain), html_mode=False,
+                                        reply_to=None if i == 0 else first_id)
+            if first_id is None:
+                first_id = mid
+
+        if not self.cfg.send_attachments:
+            return
+        limit = self.cfg.max_attachment_mb * 1024 * 1024
+        for name, content in extract_attachments(msg):
+            size_mb = len(content) / 1024 / 1024
+            if len(content) > limit:
+                self.tg.send_text(f"📎 Вложение «{name}» ({size_mb:.1f} МБ) больше лимита "
+                                  f"{self.cfg.max_attachment_mb} МБ — смотрите в почте.", reply_to=first_id)
+                continue
+            try:
+                self.tg.send_document(name, content, reply_to=first_id)
+            except TelegramPermanentError as exc:
+                log.warning("Не удалось отправить вложение %s: %s", name, exc)
+
+
+# ───────────────────────────── команды ─────────────────────────────
+
+def auth_hint(exc: Exception) -> str:
+    text = str(exc).lower()
+    if "authenticationfailed" in text or "invalid credentials" in text or "application-specific password" in text:
+        return ("\n   Подсказка: для Gmail в IMAP_PASSWORD нужен пароль приложения "
+                "(https://myaccount.google.com/apppasswords), а не обычный пароль. "
+                "Пароль приложения сбрасывается при смене пароля Google.")
+    return ""
+
+
+class GracefulExit:
+    def __init__(self):
+        self.stop = False
+        signal.signal(signal.SIGTERM, self._handler)
+        signal.signal(signal.SIGINT, self._handler)
+
+    def _handler(self, *_):
+        log.info("Получен сигнал остановки")
+        self.stop = True
+
+    def sleep(self, seconds: float) -> None:
+        end = time.monotonic() + seconds
+        while not self.stop and time.monotonic() < end:
+            time.sleep(min(1.0, end - time.monotonic()))
+
+
+def run_forever(cfg: Config) -> None:
+    cfg.require("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "IMAP_USER", "IMAP_PASSWORD")
+    forwarder = Forwarder(cfg)
+    exit_flag = GracefulExit()
+    log.info("mail2tg запущен. Папка: %s, фильтр: %s, интервал: %s с",
+             cfg.imap_folder, ", ".join(cfg.from_filter) or "все письма", cfg.poll_interval)
+    backoff = cfg.poll_interval
+    while not exit_flag.stop:
+        try:
+            forwarder.poll()
+            backoff = cfg.poll_interval
+        except TelegramTemporaryError as exc:
+            log.error("Telegram недоступен: %s. Письмо будет отправлено при следующей проверке.", exc)
+        except TelegramPermanentError as exc:
+            log.error("Telegram отклонил запрос: %s. Проверьте TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID.", exc)
+            backoff = min(backoff * 2, 600)
+        except (imaplib.IMAP4.error, OSError, socket.timeout, ssl.SSLError) as exc:
+            log.error("Ошибка IMAP: %s. Переподключусь через %s с.%s", exc, backoff, auth_hint(exc))
+            forwarder.mailbox.close()
+            exit_flag.sleep(backoff)
+            backoff = min(backoff * 2, 600)
+            continue
+        except Exception:
+            log.exception("Непредвиденная ошибка")
+            forwarder.mailbox.close()
+            backoff = min(backoff * 2, 600)
+        exit_flag.sleep(backoff)
+    forwarder.mailbox.close()
+    log.info("mail2tg остановлен")
+
+
+def run_once(cfg: Config) -> None:
+    cfg.require("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "IMAP_USER", "IMAP_PASSWORD")
+    forwarder = Forwarder(cfg)
+    try:
+        sent = forwarder.poll()
+        print(f"Готово, переслано писем: {sent}")
+    finally:
+        forwarder.mailbox.close()
+
+
+def run_check(cfg: Config) -> None:
+    ok = True
+    print("1) Почта")
+    if not (cfg.imap_user and cfg.imap_password):
+        print("   ✗ Не заполнены IMAP_USER / IMAP_PASSWORD")
+        ok = False
+    else:
+        box = Mailbox(cfg)
+        try:
+            box.connect()
+            print(f"   ✓ Вход выполнен ({cfg.imap_host}:{cfg.imap_port})")
+            folders = box.list_folders()
+            print(f"   Папки: {', '.join(folders) if folders else '(список пуст)'}")
+            validity, uidnext = box.status()
+            print(f"   ✓ Папка {cfg.imap_folder}: писем примерно {uidnext - 1} (UIDNEXT={uidnext})")
+        except Exception as exc:
+            print(f"   ✗ Ошибка: {exc}{auth_hint(exc)}")
+            ok = False
+        finally:
+            box.close()
+
+    print("2) Telegram")
+    if not cfg.tg_token:
+        print("   ✗ Не заполнен TELEGRAM_BOT_TOKEN")
+        ok = False
+    else:
+        tg = Telegram(cfg.tg_token, cfg.tg_chat_id, cfg.tg_proxy)
+        try:
+            me = tg.call("getMe", attempts=2)
+            print(f"   ✓ Бот: @{me.get('username')}")
+            if not cfg.tg_chat_id:
+                print("   ✗ Не заполнен TELEGRAM_CHAT_ID (узнать: python3 mail2tg.py --get-chat-id)")
+                ok = False
+            else:
+                tg.send_text("✅ mail2tg: тестовое сообщение, всё настроено.")
+                print("   ✓ Тестовое сообщение отправлено")
+        except Exception as exc:
+            print(f"   ✗ Ошибка: {exc}")
+            ok = False
+
+    print(f"3) Фильтр отправителей: {', '.join(cfg.from_filter) or 'не задан — будут пересылаться ВСЕ письма'}")
+    print("\nВсё в порядке." if ok else "\nЕсть ошибки, исправьте .env и запустите проверку снова.")
+    sys.exit(0 if ok else 1)
+
+
+def run_get_chat_id(cfg: Config) -> None:
+    cfg.require("TELEGRAM_BOT_TOKEN")
+    tg = Telegram(cfg.tg_token, proxy=cfg.tg_proxy)
+    me = tg.call("getMe", attempts=2)
+    updates = tg.call("getUpdates", {"timeout": 0}, attempts=2)
+    chats = {}
+    for upd in updates:
+        for key in ("message", "channel_post", "my_chat_member", "edited_message"):
+            chat = (upd.get(key) or {}).get("chat")
+            if chat:
+                title = chat.get("title") or " ".join(
+                    filter(None, [chat.get("first_name"), chat.get("last_name")])) or chat.get("username", "")
+                chats[chat["id"]] = f"{title} ({chat.get('type')})"
+    if not chats:
+        print(f"Сообщений не найдено. Откройте https://t.me/{me.get('username')}, нажмите «Старт» "
+              f"(или напишите что-нибудь) и запустите команду снова.")
+        return
+    print("Найденные чаты — скопируйте нужный id в TELEGRAM_CHAT_ID:")
+    for chat_id, title in chats.items():
+        print(f"  {chat_id}\t{title}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Пересылка писем из IMAP в Telegram")
+    parser.add_argument("--env", default=str(BASE_DIR / ".env"), help="путь к .env (по умолчанию рядом со скриптом)")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--check", action="store_true", help="проверить подключение к почте и Telegram")
+    group.add_argument("--get-chat-id", action="store_true", help="показать chat_id из последних сообщений боту")
+    group.add_argument("--once", action="store_true", help="один проход и выход")
+    args = parser.parse_args()
+
+    load_env_file(Path(args.env))
+    logging.basicConfig(
+        level=env_str("LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    cfg = Config.from_env()
+
+    if args.check:
+        run_check(cfg)
+    elif args.get_chat_id:
+        run_get_chat_id(cfg)
+    elif args.once:
+        run_once(cfg)
+    else:
+        run_forever(cfg)
+
+
+if __name__ == "__main__":
+    main()

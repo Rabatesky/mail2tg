@@ -1,0 +1,21 @@
+[Unit]
+Description=mail2tg - forward emails to Telegram
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__APP_DIR__
+ExecStart=__APP_DIR__/.venv/bin/python __APP_DIR__/mail2tg.py
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=15
+
+# Защита: сервис может писать только в свою папку
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=__APP_DIR__
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
