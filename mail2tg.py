@@ -108,6 +108,8 @@ class Config:
     translate_from: str
     translate_to: str
     translate_proxy: str
+    translate_providers: list[str]
+    mymemory_email: str
     backfill: int
     state_file: Path
 
@@ -146,6 +148,8 @@ class Config:
             translate_from=env_str("TRANSLATE_FROM", "en") or "auto",
             translate_to=env_str("TRANSLATE_TO", "ru") or "ru",
             translate_proxy=env_str("TRANSLATE_PROXY"),
+            translate_providers=[x.strip().lower() for x in env_str("TRANSLATE_PROVIDERS", "google,mymemory").split(",") if x.strip()],
+            mymemory_email=env_str("MYMEMORY_EMAIL"),
             backfill=max(0, env_int("BACKFILL_ON_FIRST_RUN", 0)),
             state_file=state_file,
         )
@@ -432,108 +436,216 @@ def mostly_cyrillic(text: str) -> bool:
     return cyr / len(letters) > 0.5
 
 
-def split_for_translation(text: str, limit: int) -> list[tuple[str, str]]:
-    """Делит текст на куски ≤ limit символов. Возвращает пары (кусок, разделитель после него)."""
-    pieces: list[tuple[str, str]] = []
-    buf = ""
-    for line in text.split("\n"):
-        if len(line) > limit:
-            if buf:
-                pieces.append((buf, "\n"))
-                buf = ""
-            current = ""
-            for sentence in re.split(r"(?<=[.!?…])\s+", line):
-                while len(sentence) > limit:
-                    if current:
-                        pieces.append((current, " "))
-                        current = ""
-                    cut = sentence.rfind(" ", 0, limit)
-                    cut = cut if cut > limit // 2 else limit
-                    pieces.append((sentence[:cut], " "))
-                    sentence = sentence[cut:].lstrip()
-                if current and len(current) + 1 + len(sentence) > limit:
-                    pieces.append((current, " "))
-                    current = sentence
-                else:
-                    current = f"{current} {sentence}" if current else sentence
+def split_long(text: str, limit: int, size=len) -> list[str]:
+    """Режет длинную строку на куски ≤ limit (по предложениям, затем по словам). Куски склеиваются пробелом."""
+    if size(text) <= limit:
+        return [text]
+    pieces: list[str] = []
+    current = ""
+    for sentence in re.split(r"(?<=[.!?…])\s+", text):
+        while size(sentence) > limit:
             if current:
-                pieces.append((current, "\n"))
-            continue
-        candidate = f"{buf}\n{line}" if buf else line
-        if len(candidate) > limit:
-            pieces.append((buf, "\n"))
-            buf = line
+                pieces.append(current)
+                current = ""
+            cut = limit
+            while cut > 1 and size(sentence[:cut]) > limit:
+                cut -= 10
+            space = sentence.rfind(" ", 0, cut)
+            cut = space if space > cut // 2 else cut
+            pieces.append(sentence[:cut])
+            sentence = sentence[cut:].lstrip()
+        if current and size(f"{current} {sentence}") > limit:
+            pieces.append(current)
+            current = sentence
         else:
-            buf = candidate
-    if buf:
-        pieces.append((buf, "\n"))
+            current = f"{current} {sentence}" if current else sentence
+    if current:
+        pieces.append(current)
     return pieces
 
 
-class GoogleTranslate:
-    """Бесплатный (неофициальный) эндпоинт Google Translate — без ключа и регистрации."""
+BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 
-    URL = "https://translate.googleapis.com/translate_a/single"
-    CHUNK = 1800  # текст идёт в адресе запроса, поэтому куски небольшие
 
-    def __init__(self, source: str = "auto", target: str = "ru", proxy: str = ""):
-        self.source = source
-        self.target = target
+class TranslateProvider:
+    name = "base"
+    limit = 1000          # максимальный размер одного куска текста
+    size = staticmethod(len)
+
+    def __init__(self, source: str, target: str, proxy: str = ""):
+        self.source, self.target = source, target
         self.session = requests.Session()
-        self.session.headers["User-Agent"] = (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-        )
+        self.session.headers["User-Agent"] = BROWSER_UA
         if proxy:
             self.session.proxies = {"http": proxy, "https": proxy}
 
-    def _request(self, text: str) -> tuple[str, str | None]:
-        params = {"client": "gtx", "sl": self.source, "tl": self.target, "dt": "t", "q": text}
+    def _get(self, url: str, params) -> requests.Response:
         last_error: Exception | None = None
         for attempt in range(3):
             try:
-                resp = self.session.get(self.URL, params=params, timeout=(10, 30))
+                resp = self.session.get(url, params=params, timeout=(10, 30))
                 if resp.status_code == 429:
-                    raise TranslationError("Google ограничил частоту запросов (429)")
+                    # обычно это блокировка IP, повторы не помогут
+                    raise TranslationError(f"{self.name}: сервис ограничил запросы (429)")
                 resp.raise_for_status()
-                data = resp.json()
-                segments = data[0] or []
-                translated = "".join(seg[0] for seg in segments if seg and isinstance(seg[0], str))
-                detected = data[2] if len(data) > 2 and isinstance(data[2], str) else None
-                if not translated and text.strip():
-                    raise TranslationError("пустой ответ")
-                return translated, detected
-            except (requests.RequestException, ValueError, TypeError, IndexError, TranslationError) as exc:
+                return resp
+            except requests.RequestException as exc:
                 last_error = exc
                 time.sleep(3 * (attempt + 1))
-        raise TranslationError(str(last_error))
+        raise TranslationError(f"{self.name}: {last_error}")
+
+    def translate_lines(self, lines: list[str]) -> list[str]:
+        """Переводит список строк, сохраняя их количество и порядок."""
+        result = []
+        for line in lines:
+            parts = split_long(line, self.limit, self.size)
+            result.append(" ".join(self.translate_batch(parts)))
+        return result
+
+    def translate_batch(self, texts: list[str]) -> list[str]:
+        return [self.translate_one(t) for t in texts]
+
+    def translate_one(self, text: str) -> str:
+        raise NotImplementedError
+
+
+class GoogleClients5(TranslateProvider):
+    """Google Translate через эндпоинт расширения Chrome. Без ключа."""
+    name = "google"
+    limit = 1500
+    URL = "https://clients5.google.com/translate_a/t"
+
+    def _query(self, texts: list[str]) -> list[str]:
+        params = [("client", "dict-chrome-ex"), ("sl", self.source), ("tl", self.target)]
+        params += [("q", t) for t in texts]
+        try:
+            data = self._get(self.URL, params).json()
+        except ValueError as exc:
+            raise TranslationError(f"{self.name}: непонятный ответ ({exc})")
+        if isinstance(data, str):
+            data = [data]
+        out = []
+        for item in data if isinstance(data, list) else []:
+            while isinstance(item, list) and item:  # при sl=auto приходит [перевод, язык]
+                item = item[0]
+            if isinstance(item, str):
+                out.append(item)
+        return out
+
+    def translate_one(self, text: str) -> str:
+        out = self._query([text])
+        if len(out) != 1 or not out[0].strip():
+            raise TranslationError(f"{self.name}: пустой ответ")
+        return out[0]
+
+    def translate_lines(self, lines: list[str]) -> list[str]:
+        # строки отправляются пачками по несколько штук в одном запросе
+        units: list[list[str]] = [split_long(line, self.limit) for line in lines]
+        flat = [piece for unit in units for piece in unit]
+        translated: list[str] = []
+        batch: list[str] = []
+
+        def flush():
+            if not batch:
+                return
+            if translated:
+                time.sleep(0.3)
+            out = self._query(batch)
+            if len(out) != len(batch):  # пачку не поняли — переводим по одной
+                out = [self.translate_one(t) for t in batch]
+            translated.extend(out)
+            batch.clear()
+
+        for piece in flat:
+            if batch and (sum(map(len, batch)) + len(piece) > self.limit or len(batch) >= 40):
+                flush()
+            batch.append(piece)
+        flush()
+
+        result, pos = [], 0
+        for unit in units:
+            result.append(" ".join(translated[pos:pos + len(unit)]))
+            pos += len(unit)
+        return result
+
+
+class MyMemory(TranslateProvider):
+    """MyMemory: бесплатно, 5 000 символов в день (50 000 — если указан email)."""
+    name = "mymemory"
+    limit = 450
+    size = staticmethod(lambda s: len(s.encode("utf-8")))
+    URL = "https://api.mymemory.translated.net/get"
+
+    def __init__(self, source: str, target: str, proxy: str = "", email_addr: str = ""):
+        super().__init__("en" if source == "auto" else source, target, proxy)
+        self.email = email_addr
+
+    def translate_one(self, text: str) -> str:
+        params = {"q": text, "langpair": f"{self.source}|{self.target}"}
+        if self.email:
+            params["de"] = self.email
+        try:
+            data = self._get(self.URL, params).json()
+        except ValueError as exc:
+            raise TranslationError(f"{self.name}: непонятный ответ ({exc})")
+        translated = (data.get("responseData") or {}).get("translatedText") or ""
+        status = str(data.get("responseStatus", "200"))
+        if status != "200" or "MYMEMORY WARNING" in translated.upper() or not translated.strip():
+            raise TranslationError(f"{self.name}: {data.get('responseDetails') or translated or status}")
+        time.sleep(0.2)
+        return html.unescape(translated)
+
+
+class Translator:
+    """Переводит текст первым сработавшим сервисом из списка."""
+
+    def __init__(self, providers: list[TranslateProvider], target: str):
+        self.providers = providers
+        self.target = target
+        self.last_provider = ""
 
     def translate(self, text: str) -> str:
         if not text.strip():
             return text
         if self.target == "ru" and mostly_cyrillic(text):
             return text  # уже по-русски
-        out = []
-        for i, (piece, sep) in enumerate(split_for_translation(text, self.CHUNK)):
-            if not piece.strip():
-                out.append(piece + sep)
+        lines = text.split("\n")
+        idx = [i for i, line in enumerate(lines) if any(ch.isalpha() for ch in line)]
+        errors = []
+        for provider in self.providers:
+            try:
+                translated = provider.translate_lines([lines[i].strip() for i in idx])
+            except TranslationError as exc:
+                errors.append(str(exc))
+                log.warning("Переводчик %s не сработал: %s", provider.name, exc)
                 continue
-            if i:
-                time.sleep(0.3)
-            translated, detected = self._request(piece)
-            if i == 0 and detected == self.target:
-                return text  # письмо уже на нужном языке
-            out.append(translated.strip("\n") + sep)
-        return "".join(out).rstrip()
+            result = list(lines)
+            for i, t in zip(idx, translated):
+                result[i] = t
+            self.last_provider = provider.name
+            return "\n".join(result)
+        raise TranslationError("; ".join(errors) or "нет доступных переводчиков")
 
 
-def make_translator(cfg: Config) -> GoogleTranslate | None:
+PROVIDER_TITLES = {"google": "Google Translate", "mymemory": "MyMemory"}
+
+
+def make_translator(cfg: Config) -> Translator | None:
     if not cfg.translate:
         return None
-    return GoogleTranslate(cfg.translate_from, cfg.translate_to, cfg.translate_proxy)
+    providers: list[TranslateProvider] = []
+    for name in cfg.translate_providers:
+        if name == "google":
+            providers.append(GoogleClients5(cfg.translate_from, cfg.translate_to, cfg.translate_proxy))
+        elif name == "mymemory":
+            providers.append(MyMemory(cfg.translate_from, cfg.translate_to, cfg.translate_proxy, cfg.mymemory_email))
+        else:
+            log.warning("Неизвестный переводчик в TRANSLATE_PROVIDERS: %s (есть: google, mymemory)", name)
+    return Translator(providers, cfg.translate_to) if providers else None
 
 
-def format_messages(msg: Message, cfg: Config, translator: "GoogleTranslate | None" = None) -> list[str]:
+def format_messages(msg: Message, cfg: Config, translator: "Translator | None" = None) -> list[str]:
     """Готовит текст письма для Telegram: список HTML-сообщений, каждое ≤ 4096 символов."""
     sender_name, sender_addr = parseaddr(decode_mime(msg.get("From")))
     sender = f"{sender_name} <{sender_addr}>" if sender_name else sender_addr
@@ -558,7 +670,7 @@ def format_messages(msg: Message, cfg: Config, translator: "GoogleTranslate | No
             new_body = translator.translate(body)
             if new_subject != subject or new_body != body:
                 subject, body = new_subject, normalize_text(new_body)
-                translate_note = "🌐 переведено Google Translate"
+                translate_note = f"🌐 переведено ({PROVIDER_TITLES.get(translator.last_provider, translator.last_provider)})"
         except TranslationError as exc:
             log.warning("Перевод не удался (%s), отправляю оригинал", exc)
             translate_note = "⚠️ перевод не удался — оригинал"
@@ -915,18 +1027,35 @@ def run_check(cfg: Config) -> None:
 
     print("3) Перевод")
     translator = make_translator(cfg)
+    translate_ok = True
     if translator is None:
         print("   выключен (TRANSLATE=false)")
     else:
-        try:
-            sample = "Hello! This is a test of the translation."
-            print(f"   ✓ «{sample}» → «{translator.translate(sample)}»")
-        except TranslationError as exc:
-            print(f"   ✗ Google Translate недоступен: {exc}\n"
-                  f"   Письма будут приходить без перевода. Можно задать TRANSLATE_PROXY.")
+        sample = "Hello! This is a test of the translation.\nSecond line."
+        working = []
+        for provider in translator.providers:
+            title = PROVIDER_TITLES.get(provider.name, provider.name)
+            try:
+                result = Translator([provider], cfg.translate_to).translate(sample)
+                print(f"   ✓ {title}: «{result.replace(chr(10), ' / ')}»")
+                working.append(title)
+            except TranslationError as exc:
+                print(f"   ✗ {title}: {exc}")
+        if working:
+            print(f"   Будет использоваться: {working[0]}"
+                  + (f" (запасной: {', '.join(working[1:])})" if len(working) > 1 else ""))
+        else:
+            translate_ok = False
+            print("   Ни один переводчик не работает — письма будут приходить без перевода.\n"
+                  "   Можно задать TRANSLATE_PROXY.")
 
     print(f"4) Фильтр отправителей: {', '.join(cfg.from_filter) or 'не задан — будут пересылаться ВСЕ письма'}")
-    print("\nВсё в порядке." if ok else "\nЕсть ошибки, исправьте .env и запустите проверку снова.")
+    if not ok:
+        print("\nЕсть ошибки, исправьте .env и запустите проверку снова.")
+    elif not translate_ok:
+        print("\nПочта и Telegram в порядке, но перевод не работает (письма будут приходить в оригинале).")
+    else:
+        print("\nВсё в порядке.")
     sys.exit(0 if ok else 1)
 
 
