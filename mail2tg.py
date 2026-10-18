@@ -112,6 +112,10 @@ class Config:
     translate_from: str
     translate_to: str
     translate_proxy: str
+    llm_api_url: str
+    llm_api_key: str
+    llm_model: str
+    llm_extra_prompt: str
     translate_providers: list[str]
     mymemory_email: str
     backfill: int
@@ -156,8 +160,12 @@ class Config:
             translate_from=env_str("TRANSLATE_FROM", "en") or "auto",
             translate_to=env_str("TRANSLATE_TO", "ru") or "ru",
             translate_proxy=env_str("TRANSLATE_PROXY"),
-            translate_providers=[x.strip().lower() for x in env_str("TRANSLATE_PROVIDERS", "google,mymemory").split(",") if x.strip()],
+            translate_providers=[x.strip().lower() for x in env_str("TRANSLATE_PROVIDERS", "llm,google,mymemory").split(",") if x.strip()],
             mymemory_email=env_str("MYMEMORY_EMAIL"),
+            llm_api_url=env_str("LLM_API_URL", "https://openrouter.ai/api/v1/chat/completions"),
+            llm_api_key=env_str("LLM_API_KEY"),
+            llm_model=env_str("LLM_MODEL", "deepseek/deepseek-v4.1-flash-1017"),
+            llm_extra_prompt=env_str("LLM_EXTRA_PROMPT"),
             backfill=max(0, env_int("BACKFILL_ON_FIRST_RUN", 0)),
             state_file=state_file,
         )
@@ -487,6 +495,7 @@ BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 
 class TranslateProvider:
     name = "base"
+    title = "переводчик"
     limit = 1000          # максимальный размер одного куска текста
     size = staticmethod(len)
 
@@ -530,6 +539,7 @@ class TranslateProvider:
 class GoogleClients5(TranslateProvider):
     """Google Translate через эндпоинт расширения Chrome. Без ключа."""
     name = "google"
+    title = "Google Translate"
     limit = 1500
     URL = "https://clients5.google.com/translate_a/t"
 
@@ -590,6 +600,7 @@ class GoogleClients5(TranslateProvider):
 class MyMemory(TranslateProvider):
     """MyMemory: бесплатно, 5 000 символов в день (50 000 — если указан email)."""
     name = "mymemory"
+    title = "MyMemory"
     limit = 450
     size = staticmethod(lambda s: len(s.encode("utf-8")))
     URL = "https://api.mymemory.translated.net/get"
@@ -621,6 +632,7 @@ class Translator:
         self.providers = providers
         self.target = target
         self.last_provider = ""
+        self.last_title = ""
 
     def translate(self, text: str) -> str:
         if not text.strip():
@@ -650,11 +662,149 @@ class Translator:
                 log.warning("Переводчик %s не сработал: %s", provider.name, exc)
                 continue
             self.last_provider = provider.name
+            self.last_title = provider.title
             return out
         raise TranslationError("; ".join(errors) or "нет доступных переводчиков")
 
 
-PROVIDER_TITLES = {"google": "Google Translate", "mymemory": "MyMemory"}
+LLM_SYSTEM_PROMPT = """Ты — редактор русскоязычного крипто-телеграм-канала. Переводишь англоязычные крипто-рассылки
+(NFT, DeFi, трейдинг, ончейн-аналитика) на русский так, как пишут в русском криптокомьюнити: живо, коротко, со
+сленгом, а не дословно.
+
+Правила:
+1. НЕ переводи и не транслитерируй имена собственные: названия NFT-коллекций, проектов, токенов и тикеров, сетей,
+   бирж и маркетплейсов (например: RobinPunks, Internet Monkes, Zero to Hero Academy, Stonk Interns, Robinhood Chain,
+   OpenSea, Blur, Magic Eden, BANANA, ETH), @никнеймы, #хэштеги, адреса, номера токенов (#7853), числа, проценты,
+   суммы и время. Название рассылки тоже оставь как есть.
+2. Устоявшиеся термины переводи так, как говорят в комьюнити:
+   mint → минт, free mint → фри-минт, minters → минтеры, floor / floor price → флор, swept the floor → свипнул флор,
+   sweep → свип, whale → кит, holders → холдеры, stakers / staking → стейкеры / стейкинг, listing → листинг,
+   reveal → ревил, supply → саплай, traits → трейты, rarity → редкость, volume → объём, onchain → ончейн,
+   wallet → кошелёк, tx → tx (транзакция), contract → контракт, airdrop → эирдроп, pump / dump → памп / дамп,
+   rug → раг, PnL → PnL, alpha → альфа, degen → деген, top movers → лидеры движения.
+3. Вход — JSON-массив фрагментов текста из HTML-письма в порядке следования. Соседние фрагменты часто — части
+   одного предложения, разорванного ссылкой или жирным шрифтом (например: "One buyer moved" / "Zero to Hero Academy" /
+   "and" / "Internet Monkes" / "holders rallied"). Переводи их так, чтобы при склейке подряд получался естественный
+   русский текст; при необходимости переставляй слова внутри фрагментов, но не объединяй и не пропускай фрагменты.
+   Пустых фрагментов в ответе быть не должно: если фрагмент — только имя собственное, верни его без изменений.
+4. Сохраняй эмодзи, кавычки, знаки препинания по краям фрагмента и регистр (ЗАГЛАВНЫЕ подписи оставляй заглавными).
+5. Ответ — строго JSON-объект {"translations": [...]}, где массив той же длины, что и вход, в том же порядке.
+   Без пояснений и без markdown."""
+
+
+class LLMTranslate(TranslateProvider):
+    """Перевод через ИИ по OpenAI-совместимому API (по умолчанию OpenRouter)."""
+    name = "llm"
+    CHUNK_CHARS = 5000  # столько исходного текста в одном запросе (ответ на русском примерно в 1.5 раза длиннее)
+
+    def __init__(self, source: str, target: str, proxy: str, api_url: str, api_key: str, model: str,
+                 extra_prompt: str = ""):
+        super().__init__(source, target, proxy)
+        self.api_url, self.api_key, self.model = api_url, api_key, model
+        self.extra_prompt = extra_prompt
+        self.title = f"ИИ · {model.split('/')[-1]}"
+
+    def _system_prompt(self) -> str:
+        prompt = LLM_SYSTEM_PROMPT
+        if self.target != "ru":
+            prompt += f"\n\nВАЖНО: переводи на язык с кодом «{self.target}», сохраняя те же правила."
+        if self.extra_prompt:
+            prompt += f"\n\nДополнительно: {self.extra_prompt}"
+        return prompt
+
+    def _chat(self, fragments: list[str], strict_note: str = "") -> list[str]:
+        user = json.dumps(fragments, ensure_ascii=False)
+        if strict_note:
+            user = strict_note + "\n\n" + user
+        payload = {
+            "model": self.model,
+            "temperature": 0.2,
+            "messages": [{"role": "system", "content": self._system_prompt()},
+                         {"role": "user", "content": user}],
+        }
+        headers = {"Authorization": f"Bearer {self.api_key}", "X-Title": "mail2tg",
+                   "HTTP-Referer": "https://github.com/mail2tg"}
+        last_error = ""
+        for attempt in range(3):
+            try:
+                resp = self.session.post(self.api_url, json=payload, headers=headers, timeout=(15, 300))
+            except requests.RequestException as exc:
+                last_error = str(exc)
+                time.sleep(5 * (attempt + 1))
+                continue
+            if resp.status_code in (401, 402, 403, 404):
+                try:
+                    detail = resp.json().get("error", {}).get("message", resp.text[:200])
+                except ValueError:
+                    detail = resp.text[:200]
+                hint = {401: "неверный LLM_API_KEY", 402: "на балансе закончились деньги",
+                        403: "доступ запрещён", 404: "нет такой модели — проверьте LLM_MODEL"}[resp.status_code]
+                raise TranslationError(f"{self.name}: {hint} ({detail})")
+            if resp.status_code == 429 or resp.status_code >= 500:
+                last_error = f"HTTP {resp.status_code}"
+                time.sleep(10 * (attempt + 1))
+                continue
+            try:
+                data = resp.json()
+                if "error" in data:
+                    raise TranslationError(f"{self.name}: {data['error'].get('message', data['error'])}")
+                content = data["choices"][0]["message"]["content"] or ""
+            except (ValueError, KeyError, IndexError, TypeError) as exc:
+                last_error = f"непонятный ответ API ({exc})"
+                continue
+            usage = data.get("usage") or {}
+            if usage:
+                log.info("ИИ-перевод: %s фрагм., токенов %s → %s", len(fragments),
+                         usage.get("prompt_tokens"), usage.get("completion_tokens"))
+            return parse_llm_list(content)
+        raise TranslationError(f"{self.name}: {last_error or 'не удалось получить ответ'}")
+
+    def _translate_chunk(self, chunk: list[str]) -> list[str]:
+        out = self._chat(chunk)
+        if len(out) != len(chunk):
+            log.warning("ИИ вернул %s фрагментов вместо %s, повторяю", len(out), len(chunk))
+            out = self._chat(chunk, f"Внимание: во входе ровно {len(chunk)} фрагментов, "
+                                    f"в ответе должно быть ровно {len(chunk)}.")
+        if len(out) != len(chunk):
+            raise TranslationError(f"{self.name}: ИИ вернул {len(out)} фрагментов вместо {len(chunk)}")
+        return [t if t.strip() else src for t, src in zip(out, chunk)]
+
+    def translate_lines(self, lines: list[str]) -> list[str]:
+        if not self.api_key:
+            raise TranslationError(f"{self.name}: не задан LLM_API_KEY")
+        result: list[str] = []
+        chunk: list[str] = []
+        size = 0
+        for line in lines:
+            if chunk and size + len(line) > self.CHUNK_CHARS:
+                result.extend(self._translate_chunk(chunk))
+                chunk, size = [], 0
+            chunk.append(line)
+            size += len(line)
+        if chunk:
+            result.extend(self._translate_chunk(chunk))
+        return result
+
+
+def parse_llm_list(content: str) -> list[str]:
+    """Достаёт список переводов из ответа модели (JSON, возможно в ```-блоке)."""
+    text = content.strip()
+    fence = re.search(r"```(?:json)?\s*(.*?)```", text, re.S)
+    if fence:
+        text = fence.group(1).strip()
+    starts = [i for i in (text.find("{"), text.find("[")) if i >= 0]
+    if not starts:
+        raise TranslationError("llm: в ответе нет JSON")
+    text = text[min(starts):]
+    try:
+        data, _ = json.JSONDecoder().raw_decode(text)
+    except ValueError as exc:
+        raise TranslationError(f"llm: битый JSON в ответе ({exc})")
+    if isinstance(data, dict):
+        data = data.get("translations", next((v for v in data.values() if isinstance(v, list)), None))
+    if not isinstance(data, list):
+        raise TranslationError("llm: в ответе нет списка переводов")
+    return [str(x) if x is not None else "" for x in data]
 
 
 def make_translator(cfg: Config) -> Translator | None:
@@ -662,12 +812,18 @@ def make_translator(cfg: Config) -> Translator | None:
         return None
     providers: list[TranslateProvider] = []
     for name in cfg.translate_providers:
-        if name == "google":
+        if name == "llm":
+            if cfg.llm_api_key:
+                providers.append(LLMTranslate(cfg.translate_from, cfg.translate_to, cfg.translate_proxy,
+                                              cfg.llm_api_url, cfg.llm_api_key, cfg.llm_model, cfg.llm_extra_prompt))
+            else:
+                log.debug("ИИ-перевод пропущен: не задан LLM_API_KEY")
+        elif name == "google":
             providers.append(GoogleClients5(cfg.translate_from, cfg.translate_to, cfg.translate_proxy))
         elif name == "mymemory":
             providers.append(MyMemory(cfg.translate_from, cfg.translate_to, cfg.translate_proxy, cfg.mymemory_email))
         else:
-            log.warning("Неизвестный переводчик в TRANSLATE_PROVIDERS: %s (есть: google, mymemory)", name)
+            log.warning("Неизвестный переводчик в TRANSLATE_PROVIDERS: %s (есть: llm, google, mymemory)", name)
     return Translator(providers, cfg.translate_to) if providers else None
 
 
@@ -801,7 +957,7 @@ def build_header(subject: str, sender: str, date_str: str, note: str) -> str:
 
 
 def provider_note(translator: "Translator") -> str:
-    name = PROVIDER_TITLES.get(translator.last_provider, translator.last_provider)
+    name = translator.last_title or translator.last_provider
     return f"🌐 переведено ({name})"
 
 
@@ -1062,7 +1218,7 @@ class Forwarder:
         soup = BeautifulSoup(raw_html, "html.parser")
         note, lang = "", "en"
         if self.translator is not None:
-            self.translator.last_provider = ""
+            self.translator.last_provider = self.translator.last_title = ""
             try:
                 count = translate_html(soup, self.translator)
                 if subject != "(без темы)":
@@ -1247,10 +1403,12 @@ def run_check(cfg: Config) -> None:
     if translator is None:
         print("   выключен (TRANSLATE=false)")
     else:
-        sample = "Hello! This is a test of the translation.\nSecond line."
+        sample = "Whale swept the floor after the free mint ended.\nOne wallet scooped 52 of the 172 sales."
+        if cfg.translate_providers and "llm" in cfg.translate_providers and not cfg.llm_api_key:
+            print("   – ИИ: не настроен (LLM_API_KEY пуст) — переводит Google")
         working = []
         for provider in translator.providers:
-            title = PROVIDER_TITLES.get(provider.name, provider.name)
+            title = provider.title
             try:
                 result = Translator([provider], cfg.translate_to).translate(sample)
                 print(f"   ✓ {title}: «{result.replace(chr(10), ' / ')}»")
