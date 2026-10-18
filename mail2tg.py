@@ -10,11 +10,13 @@ mail2tg — пересылает письма от выбранных отпра
     python3 mail2tg.py --check       # проверить подключение к почте и Telegram
     python3 mail2tg.py --get-chat-id # узнать свой chat_id (сначала напишите боту /start)
     python3 mail2tg.py --once        # один проход и выход
+    python3 mail2tg.py --resend-last # переслать последнее письмо автора (проверить, как выглядит)
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import email
 import html
 import imaplib
@@ -35,6 +37,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 import requests
+from bs4 import BeautifulSoup, NavigableString
 
 BASE_DIR = Path(__file__).resolve().parent
 log = logging.getLogger("mail2tg")
@@ -104,6 +107,7 @@ class Config:
     max_attachment_mb: int
     max_body_chars: int
     show_links: bool
+    delivery: str
     translate: bool
     translate_from: str
     translate_to: str
@@ -118,6 +122,9 @@ class Config:
         security = env_str("IMAP_SECURITY", "ssl").lower()
         if security not in ("starttls", "ssl", "plain"):
             raise SystemExit("Ошибка в .env: IMAP_SECURITY должно быть starttls, ssl или plain")
+        delivery = env_str("DELIVERY", "html").lower()
+        if delivery not in ("html", "text", "both"):
+            raise SystemExit("Ошибка в .env: DELIVERY должно быть html, text или both")
         state_file = Path(env_str("STATE_FILE", "state.json"))
         if not state_file.is_absolute():
             state_file = BASE_DIR / state_file
@@ -144,6 +151,7 @@ class Config:
             max_attachment_mb=min(TG_BOT_FILE_LIMIT_MB, env_int("MAX_ATTACHMENT_MB", 20)),
             max_body_chars=env_int("MAX_BODY_CHARS", 12000),
             show_links=env_bool("SHOW_LINKS", False),
+            delivery=delivery,
             translate=env_bool("TRANSLATE", True),
             translate_from=env_str("TRANSLATE_FROM", "en") or "auto",
             translate_to=env_str("TRANSLATE_TO", "ru") or "ru",
@@ -233,10 +241,13 @@ class Telegram:
             data["reply_parameters"] = json.dumps({"message_id": reply_to, "allow_sending_without_reply": True})
         return self.call("sendMessage", data)["message_id"]
 
-    def send_document(self, filename: str, content: bytes, caption: str = "", reply_to: int | None = None) -> int:
+    def send_document(self, filename: str, content: bytes, caption: str = "", reply_to: int | None = None,
+                      html_mode: bool = False) -> int:
         data = {"chat_id": self.chat_id}
         if caption:
             data["caption"] = caption[:TG_CAPTION_LIMIT]
+            if html_mode:
+                data["parse_mode"] = "HTML"
         if reply_to:
             data["reply_parameters"] = json.dumps({"message_id": reply_to, "allow_sending_without_reply": True})
         files = {"document": (filename, content)}
@@ -366,11 +377,17 @@ def extract_body(msg: Message, show_links: bool) -> str:
     return ""
 
 
-def extract_attachments(msg: Message) -> list[tuple[str, bytes]]:
+def content_id(part: Message) -> str:
+    return (part.get("Content-ID") or "").strip().strip("<>").strip().lower()
+
+
+def extract_attachments(msg: Message, skip_cids: frozenset[str] | set[str] = frozenset()) -> list[tuple[str, bytes]]:
     result = []
     for index, part in enumerate(msg.walk(), start=1):
         if not is_attachment(part):
             continue
+        if skip_cids and content_id(part) in skip_cids:
+            continue  # картинка уже встроена в HTML-файл
         content = part.get_payload(decode=True)
         if not content:
             continue
@@ -612,19 +629,28 @@ class Translator:
             return text  # уже по-русски
         lines = text.split("\n")
         idx = [i for i, line in enumerate(lines) if any(ch.isalpha() for ch in line)]
+        translated = self.translate_many([lines[i].strip() for i in idx])
+        result = list(lines)
+        for i, t in zip(idx, translated):
+            result[i] = t
+        return "\n".join(result)
+
+    def translate_many(self, texts: list[str]) -> list[str]:
+        """Переводит список строк (без переносов внутри), сохраняя порядок и количество."""
+        if not texts:
+            return []
         errors = []
         for provider in self.providers:
             try:
-                translated = provider.translate_lines([lines[i].strip() for i in idx])
+                out = provider.translate_lines(texts)
+                if len(out) != len(texts):
+                    raise TranslationError(f"{provider.name}: число строк в ответе не совпало")
             except TranslationError as exc:
                 errors.append(str(exc))
                 log.warning("Переводчик %s не сработал: %s", provider.name, exc)
                 continue
-            result = list(lines)
-            for i, t in zip(idx, translated):
-                result[i] = t
             self.last_provider = provider.name
-            return "\n".join(result)
+            return out
         raise TranslationError("; ".join(errors) or "нет доступных переводчиков")
 
 
@@ -645,17 +671,143 @@ def make_translator(cfg: Config) -> Translator | None:
     return Translator(providers, cfg.translate_to) if providers else None
 
 
-def format_messages(msg: Message, cfg: Config, translator: "Translator | None" = None) -> list[str]:
-    """Готовит текст письма для Telegram: список HTML-сообщений, каждое ≤ 4096 символов."""
+# ───────────────────────────── письмо как HTML-файл ─────────────────────────────
+
+HTML_SKIP_TAGS = {"script", "style", "noscript", "code", "pre", "textarea"}
+_NOT_TEXT = re.compile(r"^(?:https?://\S+|www\.\S+|\S+@\S+\.\S+|[@#][\w.]+)$", re.I)
+_CSS_CID = re.compile(r"""url\(\s*(['"]?)cid:([^'")\s]+)\1\s*\)""", re.I)
+
+
+def extract_html_part(msg: Message) -> tuple[str | None, dict[str, str]]:
+    """Возвращает HTML-версию письма и картинки, встроенные в письмо (Content-ID → data URI)."""
+    html_parts: list[str] = []
+    cid_map: dict[str, str] = {}
+    for part in msg.walk():
+        if part.is_multipart():
+            continue
+        cid = content_id(part)
+        if cid:
+            payload = part.get_payload(decode=True)
+            if payload:
+                cid_map[cid] = f"data:{part.get_content_type()};base64,{base64.b64encode(payload).decode()}"
+        disposition = (part.get("Content-Disposition") or "").lower()
+        if part.get_content_type() == "text/html" and not disposition.startswith("attachment"):
+            html_parts.append(part_text(part))
+    if not html_parts:
+        return None, cid_map
+    return max(html_parts, key=len), cid_map
+
+
+def _worth_translating(core: str) -> bool:
+    if len(core) < 2 or _NOT_TEXT.match(core):
+        return False
+    if sum(1 for ch in core if ch.isalpha()) < 2:
+        return False
+    return not mostly_cyrillic(core)
+
+
+def translate_html(soup: BeautifulSoup, translator: "Translator") -> int:
+    """Переводит текст внутри HTML, не трогая разметку. Возвращает число переведённых фрагментов."""
+    items: list[tuple[NavigableString, str, str]] = []
+    for node in soup.find_all(string=True):
+        if type(node) is not NavigableString:  # комментарии, doctype, содержимое <style>/<script>
+            continue
+        names = [p.name for p in node.parents]
+        if any(n in HTML_SKIP_TAGS for n in names):
+            continue
+        if "head" in names and node.parent.name != "title":
+            continue
+        text = str(node)
+        core = re.sub(r"\s+", " ", text.replace("\xa0", " ")).strip()
+        if _worth_translating(core):
+            items.append((node, text, core))
+    unique = list(dict.fromkeys(core for _, _, core in items))
+    if not unique:
+        return 0
+    translated = dict(zip(unique, translator.translate_many(unique)))
+    for node, text, core in items:
+        new = (translated.get(core) or core).strip()
+        lead = " " if text[:1].isspace() else ""
+        trail = " " if text[-1:].isspace() else ""
+        node.replace_with(NavigableString(lead + new + trail))
+    return len(items)
+
+
+def finalize_html(soup: BeautifulSoup, cid_map: dict[str, str], lang: str) -> bytes:
+    """Делает из письма самостоятельный файл: кодировка, мобильная вёрстка, встроенные картинки."""
+    if cid_map:
+        for tag in soup.find_all(True):
+            for attr in ("src", "background"):
+                value = tag.get(attr)
+                if isinstance(value, str) and value.lower().startswith("cid:"):
+                    uri = cid_map.get(value[4:].strip("<> ").lower())
+                    if uri:
+                        tag[attr] = uri
+            style = tag.get("style")
+            if isinstance(style, str) and "cid:" in style.lower():
+                tag["style"] = _CSS_CID.sub(
+                    lambda m: f"url('{cid_map[m.group(2).lower()]}')" if m.group(2).lower() in cid_map else m.group(0),
+                    style)
+
+    for meta in soup.find_all("meta"):
+        if meta.get("charset") or str(meta.get("http-equiv", "")).lower() == "content-type":
+            meta.decompose()
+    html_tag = soup.find("html")
+    head = soup.find("head")
+    if head is None:
+        head = soup.new_tag("head")
+        (html_tag or soup).insert(0, head)
+    head.insert(0, soup.new_tag("meta", attrs={"charset": "utf-8"}))
+    if not head.find("meta", attrs={"name": "viewport"}):
+        head.insert(1, soup.new_tag("meta", attrs={"name": "viewport",
+                                                   "content": "width=device-width, initial-scale=1"}))
+    if html_tag is not None:
+        html_tag["lang"] = lang
+
+    out = str(soup)
+    if not out.lstrip().lower().startswith("<!doctype"):
+        out = "<!DOCTYPE html>\n" + out
+    return out.encode("utf-8")
+
+
+def safe_filename(name: str, limit: int = 80) -> str:
+    name = re.sub(r'[\\/:*?"<>|\r\n\t]+', " ", name)
+    name = re.sub(r"\s+", " ", name).strip(" .")
+    return name[:limit].rstrip(" .") or "письмо"
+
+
+def email_info(msg: Message) -> tuple[str, str, str, str]:
+    """Тема, отправитель, дата для показа и дата для имени файла."""
     sender_name, sender_addr = parseaddr(decode_mime(msg.get("From")))
     sender = f"{sender_name} <{sender_addr}>" if sender_name else sender_addr
     subject = decode_mime(msg.get("Subject")) or "(без темы)"
-    date_str = ""
+    date_str, file_date = "", ""
     try:
         if msg.get("Date"):
-            date_str = parsedate_to_datetime(msg["Date"]).astimezone().strftime("%d.%m.%Y %H:%M")
+            dt = parsedate_to_datetime(msg["Date"]).astimezone()
+            date_str, file_date = dt.strftime("%d.%m.%Y %H:%M"), dt.strftime("%Y-%m-%d")
     except Exception:
         date_str = decode_mime(msg.get("Date"))
+    return subject, sender, date_str, file_date
+
+
+def build_header(subject: str, sender: str, date_str: str, note: str) -> str:
+    header = f"📧 <b>{html.escape(subject, quote=False)}</b>\n<i>От: {html.escape(sender, quote=False)}</i>"
+    if date_str:
+        header += f"\n<i>{html.escape(date_str, quote=False)}</i>"
+    if note:
+        header += f"\n<i>{note}</i>"
+    return header
+
+
+def provider_note(translator: "Translator") -> str:
+    name = PROVIDER_TITLES.get(translator.last_provider, translator.last_provider)
+    return f"🌐 переведено ({name})"
+
+
+def format_messages(msg: Message, cfg: Config, translator: "Translator | None" = None) -> list[str]:
+    """Готовит текст письма для Telegram: список HTML-сообщений, каждое ≤ 4096 символов."""
+    subject, sender, date_str, _ = email_info(msg)
 
     body = extract_body(msg, cfg.show_links)
     truncated = False
@@ -670,17 +822,13 @@ def format_messages(msg: Message, cfg: Config, translator: "Translator | None" =
             new_body = translator.translate(body)
             if new_subject != subject or new_body != body:
                 subject, body = new_subject, normalize_text(new_body)
-                translate_note = f"🌐 переведено ({PROVIDER_TITLES.get(translator.last_provider, translator.last_provider)})"
+                translate_note = provider_note(translator)
         except TranslationError as exc:
             log.warning("Перевод не удался (%s), отправляю оригинал", exc)
             translate_note = "⚠️ перевод не удался — оригинал"
     body = body or "(письмо без текста)"
 
-    header = f"📧 <b>{html.escape(subject, quote=False)}</b>\n<i>От: {html.escape(sender, quote=False)}</i>"
-    if date_str:
-        header += f"\n<i>{html.escape(date_str, quote=False)}</i>"
-    if translate_note:
-        header += f"\n<i>{translate_note}</i>"
+    header = build_header(subject, sender, date_str, translate_note)
 
     first_limit = TG_TEXT_LIMIT - len(header) - 2
     body_chunks = chunk_escaped(body, 3800)
@@ -828,19 +976,36 @@ class Forwarder:
         """Первый запуск (или папку пересоздали): запоминаем текущую позицию, опционально досылаем последние письма."""
         backlog: list[int] = []
         if self.cfg.backfill:
-            if self.cfg.from_filter:
-                uids: set[int] = set()
-                for f in self.cfg.from_filter:
-                    uids.update(self.mailbox.search_uids(f"FROM {imap_quote(f.lstrip('@'))}"))
-                candidates = sorted(uids)
-            else:
-                candidates = self.mailbox.search_uids("ALL")
-            backlog = candidates[-self.cfg.backfill:]
+            backlog = self.candidate_uids()[-self.cfg.backfill:]
         self.state = {"uidvalidity": uidvalidity, "last_uid": uidnext - 1}
         self._save()
         log.info("Начальная позиция: UID %s. Пересылаться будут письма, пришедшие после неё%s.",
                  uidnext - 1, f" (+{len(backlog)} последних для проверки)" if backlog else "")
         return backlog
+
+    def candidate_uids(self) -> list[int]:
+        """UID писем, которые могут быть от нужных отправителей (поиск на стороне сервера)."""
+        if not self.cfg.from_filter:
+            return self.mailbox.search_uids("ALL")
+        uids: set[int] = set()
+        for f in self.cfg.from_filter:
+            uids.update(self.mailbox.search_uids(f"FROM {imap_quote(f.lstrip('@'))}"))
+        return sorted(uids)
+
+    def resend_last(self) -> str | None:
+        """Пересылает последнее письмо от нужных отправителей, не трогая сохранённую позицию."""
+        if self.mailbox.conn is None:
+            self.mailbox.connect()
+        self.mailbox.select()
+        for uid in reversed(self.candidate_uids()):
+            from_header = self.mailbox.fetch_from_header(uid)
+            if from_header is None or not sender_matches(decode_mime(from_header), self.cfg.from_filter):
+                continue
+            msg = self.mailbox.fetch_message(uid)
+            if msg is not None:
+                self.forward(msg)
+                return decode_mime(msg.get("Subject")) or "(без темы)"
+        return None
 
     def poll(self) -> int:
         """Один проход: проверяет новые письма и пересылает подходящие. Возвращает число отправленных."""
@@ -888,24 +1053,65 @@ class Forwarder:
             self._save()
         return forwarded
 
+    def _html_document(self, msg: Message) -> tuple[str, bytes, str, set[str]] | None:
+        """Готовит письмо как HTML-файл (с переводом). Возвращает (имя файла, содержимое, подпись, cid картинок)."""
+        raw_html, cid_map = extract_html_part(msg)
+        if not raw_html:
+            return None
+        subject, sender, date_str, file_date = email_info(msg)
+        soup = BeautifulSoup(raw_html, "html.parser")
+        note, lang = "", "en"
+        if self.translator is not None:
+            self.translator.last_provider = ""
+            try:
+                count = translate_html(soup, self.translator)
+                if subject != "(без темы)":
+                    subject = self.translator.translate(subject)
+                if count and self.translator.last_provider:
+                    note, lang = provider_note(self.translator), self.cfg.translate_to
+            except TranslationError as exc:
+                log.warning("Перевод не удался (%s), отправляю оригинал", exc)
+                soup = BeautifulSoup(raw_html, "html.parser")
+                note = "⚠️ перевод не удался — оригинал"
+        content = finalize_html(soup, cid_map, lang)
+        filename = safe_filename(f"{file_date} {subject}" if file_date else subject) + ".html"
+        caption = build_header(subject, sender, date_str, note) + \
+            "\n\n📄 <i>Письмо целиком — в файле. Нажмите на него и откройте в браузере.</i>"
+        used_cids = {cid for cid in cid_map if f"cid:{cid}" in raw_html.lower()}
+        return filename, content, caption, used_cids
+
     def forward(self, msg: Message) -> None:
         first_id = None
-        for i, text in enumerate(format_messages(msg, self.cfg, self.translator)):
-            try:
-                mid = self.tg.send_text(text, html_mode=True, reply_to=None if i == 0 else first_id)
-            except TelegramPermanentError as exc:
-                # например, Telegram не принял разметку — отправим без неё
-                log.warning("Telegram отклонил сообщение (%s), отправляю без форматирования", exc)
-                plain = re.sub(r"<[^>]+>", "", text)
-                mid = self.tg.send_text(html.unescape(plain), html_mode=False,
-                                        reply_to=None if i == 0 else first_id)
-            if first_id is None:
-                first_id = mid
+        used_cids: set[str] = set()
+        sent_html = False
+        if self.cfg.delivery in ("html", "both"):
+            doc = self._html_document(msg)
+            if doc is not None:
+                filename, content, caption, used_cids = doc
+                try:
+                    first_id = self.tg.send_document(filename, content, caption=caption, html_mode=True)
+                except TelegramPermanentError as exc:
+                    log.warning("Telegram отклонил подпись (%s), отправляю без форматирования", exc)
+                    plain = html.unescape(re.sub(r"<[^>]+>", "", caption))
+                    first_id = self.tg.send_document(filename, content, caption=plain)
+                sent_html = True
+
+        if not sent_html or self.cfg.delivery == "both":
+            for text in format_messages(msg, self.cfg, self.translator):
+                try:
+                    mid = self.tg.send_text(text, html_mode=True, reply_to=first_id)
+                except TelegramPermanentError as exc:
+                    # например, Telegram не принял разметку — отправим без неё
+                    log.warning("Telegram отклонил сообщение (%s), отправляю без форматирования", exc)
+                    plain = re.sub(r"<[^>]+>", "", text)
+                    mid = self.tg.send_text(html.unescape(plain), html_mode=False, reply_to=first_id)
+                if first_id is None:
+                    first_id = mid
 
         if not self.cfg.send_attachments:
             return
         limit = self.cfg.max_attachment_mb * 1024 * 1024
-        for name, content in extract_attachments(msg):
+        for name, content in extract_attachments(msg, used_cids):
             size_mb = len(content) / 1024 / 1024
             if len(content) > limit:
                 self.tg.send_text(f"📎 Вложение «{name}» ({size_mb:.1f} МБ) больше лимита "
@@ -981,6 +1187,16 @@ def run_once(cfg: Config) -> None:
     try:
         sent = forwarder.poll()
         print(f"Готово, переслано писем: {sent}")
+    finally:
+        forwarder.mailbox.close()
+
+
+def run_resend_last(cfg: Config) -> None:
+    cfg.require("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "IMAP_USER", "IMAP_PASSWORD")
+    forwarder = Forwarder(cfg)
+    try:
+        subject = forwarder.resend_last()
+        print(f"Отправлено: {subject}" if subject else "Подходящих писем в папке не найдено.")
     finally:
         forwarder.mailbox.close()
 
@@ -1088,6 +1304,8 @@ def main() -> None:
     group.add_argument("--check", action="store_true", help="проверить подключение к почте и Telegram")
     group.add_argument("--get-chat-id", action="store_true", help="показать chat_id из последних сообщений боту")
     group.add_argument("--once", action="store_true", help="один проход и выход")
+    group.add_argument("--resend-last", action="store_true",
+                       help="переслать последнее письмо от нужных отправителей (для проверки)")
     args = parser.parse_args()
 
     load_env_file(Path(args.env))
@@ -1102,6 +1320,8 @@ def main() -> None:
         run_check(cfg)
     elif args.get_chat_id:
         run_get_chat_id(cfg)
+    elif args.resend_last:
+        run_resend_last(cfg)
     elif args.once:
         run_once(cfg)
     else:
